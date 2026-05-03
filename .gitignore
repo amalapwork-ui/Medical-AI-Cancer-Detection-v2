@@ -142,6 +142,9 @@ raw_data/
 # EXPLICIT NEGATIONS — never excluded by any rule above
 # =============================================================================
 
+#models
+backend/models/*
+!backend/models/.gitkeep
 
 # Demonstration dataset — required for demos and API smoke tests.
 !demo_dataset/
