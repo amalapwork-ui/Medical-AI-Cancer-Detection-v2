@@ -898,6 +898,17 @@ class TestClassifyCancer:
             result = classify_cancer(self._arr(), "colon")
         assert result["predicted_class"] == "Colorectal Adenocarcinoma"
 
+    def test_colon_empty_class_suppressed_to_invalid_scan(self):
+        # "empty" is index 3 in the Kather 2016 class list.
+        # Background tiles are not a valid cancer classification; the class is
+        # suppressed at output time without altering the model's class list.
+        # probs[3] is highest → argmax=3 → raw_label="empty" → "Invalid Scan"
+        probs = [0.08, 0.10, 0.12, 0.45, 0.10, 0.07, 0.05, 0.03]
+        mock  = _make_mock_model(probs)
+        with patch.dict(predict_module._models, {"colon": mock}):
+            result = classify_cancer(self._arr(), "colon")
+        assert result["predicted_class"] == "Invalid Scan"
+
     def test_predicted_class_is_human_readable(self):
         # The returned predicted_class must use the LABEL_MAPPING display name,
         # not the raw training label (e.g. "Glioma" not "glioma").

@@ -58,7 +58,7 @@ FastAPI Backend  (port 8000)
 |--------|-------------|---------|---------|----------|
 | Brain  | EfficientNetV2S | masoudnickparvar/brain-tumor-mri-dataset | glioma, meningioma, notumor, pituitary | ~91% |
 | Lung   | EfficientNetV2S | hamdallak/the-iqothnccd-lung-cancer-dataset (CT) | benign, malignant, normal | ~82–90% |
-| Colon  | EfficientNetB2 | kmader/colorectal-histology-mnist (Kather 2016) | adipose, complex, debris, empty, lympho, mucosa, stroma, tumor | ~88–93% |
+| Colon  | EfficientNetB2 | kmader/colorectal-histology-mnist (Kather 2016) | adipose, complex, debris, lympho, mucosa, stroma, tumor *(empty suppressed — returns "Invalid Scan")* | ~88–93% |
 
 **Preprocessing note:** All models use `include_preprocessing=True`. Pass raw `[0, 255]` float32 — do **not** normalise to `[0, 1]`. The lung model additionally requires CLAHE (applied automatically by `predict.py`).
 

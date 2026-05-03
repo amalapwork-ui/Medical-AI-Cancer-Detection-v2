@@ -227,7 +227,7 @@ import numpy as np
 from PIL import Image, UnidentifiedImageError
 
 DEMO_ROOT   = Path("/content/demo_dataset")
-IMAGES_PER_CLASS = 20
+IMAGES_PER_CLASS = 10
 OUTPUT_SIZE = (224, 224)
 
 def select_diverse(image_paths: list[Path], n: int) -> list[Path]:
@@ -338,10 +338,10 @@ def validate_split(cancer_name: str, classes: list[str]) -> int:
         n = len(imgs)
         total += n
         ok = "✓" if n == IMAGES_PER_CLASS else f"⚠ expected {IMAGES_PER_CLASS}"
-        print(f"  {cls:20s}: {n:3d} images  {ok}")
+        print(f"  {cls:10s}: {n:3d} images  {ok}")
         if imgs:
             print(f"    first: {imgs[0].name}   last: {imgs[-1].name}")
-    print(f"  {'SUBTOTAL':20s}: {total}")
+    print(f"  {'SUBTOTAL':10s}: {total}")
     return total
 
 grand_total = 0

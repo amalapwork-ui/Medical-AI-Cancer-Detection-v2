@@ -39,15 +39,26 @@ LABEL_MAPPING: dict[str, str] = {
     "malignant" : "Malignant Lung Cancer",
     "normal"    : "Normal Lung",
     # Colon — Kather 2016 (8-class tissue classification)
+    # "empty" is intentionally absent — see COLON_EXCLUDED_CLASSES below.
     "adipose"   : "Adipose Tissue",
     "complex"   : "Complex Glandular Epithelium",
     "debris"    : "Cellular Debris",
-    "empty"     : "Background / Empty",
     "lympho"    : "Lymphocytic Infiltrate",
     "mucosa"    : "Normal Mucosa",
     "stroma"    : "Cancer-Associated Stroma",
     "tumor"     : "Colorectal Adenocarcinoma",
 }
+
+# ── Colon output suppression ──────────────────────────────────────────────────
+# The Kather 2016 model was trained on 8 classes including "empty" (background
+# tiles with no tissue present).  "empty" must stay in CLASS_LABELS to preserve
+# the correct argmax → label mapping (removing it would shift every downstream
+# index and silently misclassify every non-adipose tile).
+#
+# When the model's argmax lands on a class in this set, classify_cancer()
+# returns predicted_class="Invalid Scan" instead of a tissue label.
+# A background tile with no diagnostic tissue is not a valid cancer classification.
+COLON_EXCLUDED_CLASSES: frozenset[str] = frozenset({"empty"})
 
 # ── Confidence-based prediction quality thresholds ───────────────────────────
 # These three criteria together determine whether a prediction is reliable

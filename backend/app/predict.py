@@ -58,6 +58,7 @@ from PIL import Image, UnidentifiedImageError
 
 from .config import (
     CLASS_LABELS,
+    COLON_EXCLUDED_CLASSES,
     COLON_FLAT_IMAGE_THRESHOLDS,
     COLON_QUALITY_THRESHOLDS,
     CONF_THRESHOLD,
@@ -572,10 +573,14 @@ def classify_cancer(image_array: np.ndarray, cancer_type: str) -> dict:
         logger.info("[classify_cancer] Ambiguous — %s", reason)
         return {"predicted_class": "Invalid Scan"}
 
-    predicted_idx   = int(np.argmax(raw_probs))
-    raw_label       = class_names[predicted_idx]
-    predicted_class = LABEL_MAPPING.get(raw_label, raw_label)
+    predicted_idx = int(np.argmax(raw_probs))
+    raw_label     = class_names[predicted_idx]
 
+    if raw_label in COLON_EXCLUDED_CLASSES:
+        logger.info("[classify_cancer] Suppressed class '%s' → Invalid Scan", raw_label)
+        return {"predicted_class": "Invalid Scan"}
+
+    predicted_class = LABEL_MAPPING.get(raw_label, raw_label)
     return {"predicted_class": predicted_class}
 
 
