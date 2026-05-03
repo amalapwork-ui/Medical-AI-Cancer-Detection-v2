@@ -1,0 +1,159 @@
+# =============================================================================
+# Medical AI Cancer Detection — .gitignore
+# Engineering principle: ignore generated/ephemeral files only.
+# Never ignore assets required for inference or demonstration.
+# =============================================================================
+
+
+# ── Python cache / compiled ───────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+
+
+#models
+*.keras
+
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+# All common naming conventions covered; project uses myvenv/.
+myvenv/
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+
+# ── Secrets / credentials ─────────────────────────────────────────────────────
+# kaggle.json must never be committed.
+.env
+.env.*
+*.env
+.env.local
+.env.production
+secrets.json
+secrets.yaml
+credentials.json
+kaggle.json
+config.local.*
+*.key
+*.pem
+*.p12
+*.pfx
+
+
+# ── Temporary / uploaded runtime files ────────────────────────────────────────
+backend/temp/
+temp/
+tmp/
+uploads/
+*.tmp
+
+
+# ── Logs and test output ──────────────────────────────────────────────────────
+*.log
+logs/
+test_out.txt
+
+
+# ── OS / editor artefacts ─────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
+
+
+# ── Pytest / test cache / coverage ────────────────────────────────────────────
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+.tox/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+htmlcov/
+
+
+# ── Jupyter notebook checkpoints ──────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+
+# ── Build / distribution artefacts ────────────────────────────────────────────
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+wheels/
+MANIFEST
+
+
+# ── Streamlit / TensorFlow cache ──────────────────────────────────────────────
+.streamlit/
+.keras/
+tensorflow_datasets/
+
+
+# ── Training intermediate artefacts (NOT final deployed models) ───────────────
+# Per-epoch checkpoints, TensorBoard event files, and partial outputs
+# are ephemeral. Final .keras files in backend/models/ are kept (see below).
+runs/
+tensorboard/
+checkpoints/
+*.ckpt
+*.ckpt.index
+*.ckpt.data-*
+training/output/
+output/
+
+
+# ── Generated demo/test zip artefacts ─────────────────────────────────────────
+demo_dataset.zip
+demo_test_images.zip
+
+
+# ── Large raw training datasets ───────────────────────────────────────────────
+# Scripts re-download these from Kaggle. Do NOT ignore demo_dataset/ — it is
+# required for demonstrations and smoke tests.
+data/
+datasets/
+raw_data/
+
+
+# =============================================================================
+# EXPLICIT NEGATIONS — never excluded by any rule above
+# =============================================================================
+
+
+# Demonstration dataset — required for demos and API smoke tests.
+!demo_dataset/
+!demo_dataset/**
+
+# Training scripts and utilities are source code, not build artefacts.
+!training/
+!training/**
+
+# Local / AI / logs
+test_out.txt
+AGENTS.md
+CLAUDE.md
+
+

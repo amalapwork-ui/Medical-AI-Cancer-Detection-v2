@@ -1,0 +1,45 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# Medical AI Cancer Detection — Python 3.13, Windows CPU-only
+# Last validated: TF 2.21.0 + numpy 2.1.3 + Python 3.13.13
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Backend ───────────────────────────────────────────────────────────────────
+fastapi==0.136.1
+uvicorn[standard]==0.46.0
+
+# ── ML / Inference ────────────────────────────────────────────────────────────
+# MUST be tensorflow-cpu, NOT tensorflow.
+# The tensorflow (GPU) package loads nvcuda.dll at DLL-load time on Windows.
+# This hangs indefinitely when CUDA drivers are absent or mismatched — before
+# any Python code can set CUDA_VISIBLE_DEVICES to prevent it.
+# tensorflow-cpu has zero CUDA code; it never scans for GPUs.
+#
+# Python 3.13 requires TF >= 2.19. TF 2.21 is the current stable release.
+tensorflow-cpu==2.21.0
+
+# numpy 2.1.3 is what TF 2.21 resolves at install time — do not go above 2.1.x.
+# TF 2.21 is untested against numpy 2.2+.
+numpy>=1.26.0,<2.2
+
+pillow>=10.0.0,<12.3
+
+# ── Image processing ──────────────────────────────────────────────────────────
+# MUST be opencv-python-headless, NOT opencv-python.
+# The GUI variant loads Qt at import time, which can stall in Windows terminal
+# contexts that have no display server attached.
+opencv-python-headless>=4.9.0,<5.0
+
+# ── Frontend ──────────────────────────────────────────────────────────────────
+streamlit==1.56.0
+requests>=2.31.0,<3.0
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest>=8.0.0,<10.0
+httpx>=0.27.0,<1.0     # FastAPI TestClient dependency
+
+# ── Training only (not required for inference / deployment) ───────────────────
+scikit-learn>=1.4.0,<2.0
+matplotlib>=3.8.0,<4.0
+seaborn>=0.13.0,<1.0
+
+python-multipart

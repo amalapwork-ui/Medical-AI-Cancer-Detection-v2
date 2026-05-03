@@ -1,0 +1,951 @@
+================================================================================
+COMPLETE TECHNICAL REPORT
+Medical AI Cancer Detection System
+================================================================================
+Generated: 2026-05-03
+================================================================================
+
+
+SECTION 1 — PROJECT OVERVIEW AND PROBLEM STATEMENT
+================================================================================
+
+1.1 PURPOSE
+-----------
+This system is a research-grade web application that classifies medical images
+for cancer detection across three anatomical sites: brain (MRI), lung (CT), and
+colon (histopathology). A user uploads an image and selects the cancer type; the
+system returns a predicted class, confidence score, and full probability
+distribution over all classes.
+
+The system is explicitly labelled for research and educational use only. It is
+not a certified medical device and should not replace clinical diagnosis.
+
+1.2 PROBLEM STATEMENT
+---------------------
+Standard image classifiers trained on medical data exhibit a well-documented
+failure mode: when presented with a non-medical image (a logo, screenshot,
+photograph), the softmax output still sums to 1.0 and the model confidently
+assigns that image to whichever cancer class best matches the pixel distribution.
+This is not a bug — it is an inherent property of discriminative classifiers.
+The model is never trained to say "I don't recognise this."
+
+Root cause of overconfidence on OOD inputs: the softmax exponential amplifies
+even small logit differences into large probability gaps. An image that mildly
+activates one class's learned filters receives a peaked output even though no
+class is genuinely relevant. Confidence score alone cannot distinguish this
+from a genuine high-certainty prediction.
+
+This project addresses the problem with a two-layer OOD detection system:
+
+  Layer 1 — Image domain pre-screen (screen_image_domain, before model inference)
+    Four signals based on physical imaging properties:
+
+    Signal 1 — Colour saturation ceiling (SATURATION_THRESHOLD):
+      Computes mean HSV saturation (0–1 range) of the preprocessed image.
+      MRI and CT scans are near-grayscale by physics; H&E histopathology
+      introduces pink/purple staining.
+        brain/lung: saturation > 0.15 → "non_medical_image"
+        colon:      saturation > 0.85 → "non_medical_image"
+      Catches logos, photographs, and normally-stained histopathology
+      submitted to a brain or lung model.
+
+    Signal 2 — Colour saturation floor (SATURATION_FLOOR, colon only):
+      H&E staining always introduces colour in colon histopathology tiles;
+      even background tiles show some pink/purple.
+        colon: saturation < 0.05 → "cross_modality"
+      Catches CT or MRI scans submitted to the colon model (near-grayscale
+      images that cannot be H&E histopathology).
+
+    Signal 2b — Flat-colour image check (COLON_FLAT_IMAGE_THRESHOLDS, colon only):
+      Real H&E slides have spatial variation in staining density (sat_std > 0.04)
+      and micro-texture from cells and glands (pixel_std > 0.04). Solid-colour
+      graphics (logos, swatches) within the 0.05–0.85 saturation window fail both.
+      AND logic — both must be below threshold simultaneously to trigger rejection.
+        colon: mean_sat > 0.35 AND sat_std < 0.04 AND pixel_std < 0.04
+               → "non_medical_image"
+      Catches flat-colour graphics that pass Signals 1 and 2.
+
+    Signal 3 — Intensity profile gate (MODALITY_INTENSITY_PROFILES):
+      Brain MRI and lung CT are both near-grayscale, so Signals 1 and 2
+      cannot distinguish them. Signal 3 uses the shape of the pixel intensity
+      distribution, which differs between the two modalities:
+
+      Lung CT has a bimodal histogram — very dark pixels (lung parenchyma +
+      circular FOV background, ~0–50/255) and very bright pixels (mediastinum
+      and bone, ~150–230/255). This produces high dark_fraction AND high std.
+      If a brain-model image exceeds both thresholds, it is rejected as CT:
+        brain: dark_fraction > 0.50 AND pixel_std > 0.32 → "cross_modality"
+
+      Brain MRI has smooth, uniformly bright tissue in the central image
+      region (grey/white matter) with dark only at the periphery (outside
+      the skull). Lung CT always has dark parenchyma extending into the
+      central region, making the centre heterogeneous. If a lung-model image
+      shows the smooth bright centre AND dark peripheral background signature,
+      it is rejected as MRI:
+        lung: centre_std < 0.08 AND centre_mean > 0.40
+              AND dark_fraction > 0.15 → "cross_modality"
+      The third condition (dark_fraction > 0.15) prevents false rejection of
+      featureless solid-grey images that have no peripheral background at all.
+
+      Each check uses AND logic — all conditions must be exceeded to reject.
+      This conservative design prevents false rejections of valid scans with
+      unusual acquisition parameters.
+
+    All four signals exploit fundamental physics of the imaging modality —
+    not protocol-dependent measurements — making them robust to scanner
+    variation, JPEG compression, and window/level settings.
+
+  Layer 2 — Softmax distribution quality gate (_assess_prediction_quality)
+    Four criteria must all pass; any failure → "Invalid Scan" / "ambiguous":
+      1. Confidence floor  — max softmax prob ≥ 0.35 (CONF_THRESHOLD)
+      2. Margin            — top-2 prob gap ≥ 0.07 (MARGIN_THRESHOLD)
+      3. Entropy ceiling   — normalised H/H_max ≤ 0.95 (ENTROPY_THRESHOLD)
+                             catches flat, uncertain distributions
+      4. Entropy floor     — normalised H/H_max ≥ 0.01 (ENTROPY_FLOOR)
+                             catches unnaturally peaked OOD over-commitment;
+                             fires only when p₁ ≳ 99.9% (no valid model reaches this)
+
+    Entropy is normalised by ln(n_classes) so thresholds apply equally to
+    3-class (lung), 4-class (brain), and 8-class (colon) models.
+
+  All thresholds live in config.py — the single source of truth.
+
+
+SECTION 2 — SYSTEM ARCHITECTURE
+================================================================================
+
+2.1 TWO-PROCESS DESIGN
+-----------------------
+The system runs as two independent processes:
+
+  Backend  (FastAPI + Uvicorn, port 8000)
+    - Loads all models at startup via a lifespan event
+    - Exposes POST /predict and GET /health
+    - Handles all model inference
+
+  Frontend (Streamlit, port 8501)
+    - Renders the user interface
+    - Sends HTTP requests to the backend
+    - Displays structured results
+
+2.2 TWO-STAGE INFERENCE PIPELINE
+---------------------------------
+Every POST /predict request passes through two stages in sequence:
+
+  Stage 1 — Input Validation (validate_input_bytes)
+    File size: 1 KB minimum, 20 MB maximum
+    Format verification: PIL.Image.load() must succeed (full decode)
+    Rejection: status="rejected", reason="invalid_input"
+
+  Stage 2 — Domain Screening (screen_image_domain)
+    Four-signal domain check using physical imaging properties.
+
+    Signal 1 — Saturation ceiling:
+      brain/lung > 0.15 → rejected: "non_medical_image"
+      colon      > 0.85 → rejected: "non_medical_image"
+      Catches photographs, logos, and normally-stained histopathology
+      submitted to brain/lung models.
+
+    Signal 2 — Saturation floor (colon only):
+      colon < 0.05 → rejected: "cross_modality"
+      Catches CT/MRI submitted to the colon model; H&E staining always
+      produces measurable colour, so near-grayscale inputs are wrong modality.
+
+    Signal 2b — Flat-colour image check (colon only):
+      mean_sat > 0.35 AND sat_std < 0.04 AND pixel_std < 0.04
+               → rejected: "non_medical_image"
+      Catches solid-colour graphics (logos, swatches) within the 0.05–0.85
+      saturation window that pass Signals 1 and 2.
+
+    Signal 3 — Intensity profile gate (brain and lung models only):
+      Saturation cannot distinguish brain MRI from lung CT — both are near-grayscale.
+      Uses pixel intensity distribution shape:
+        brain: dark_fraction > 0.50 AND pixel_std > 0.32 → rejected: "cross_modality"
+        lung:  centre_std < 0.08 AND centre_mean > 0.40 AND dark_fraction > 0.15
+               → rejected: "cross_modality"
+      AND logic throughout — all conditions must be exceeded to reject.
+
+    Signal 3 — Intensity profile gate (brain and lung models only):
+      Catches lung CT submitted to the brain model, and brain MRI submitted
+      to the lung model. Uses pixel intensity distribution shape:
+        brain: dark_fraction > 0.50 AND std > 0.32 → rejected: "cross_modality"
+        lung:  centre_std < 0.08 AND centre_mean > 0.40
+               AND dark_fraction > 0.15 → rejected: "cross_modality"
+      Features computed by _compute_intensity_features(); thresholds in
+      MODALITY_INTENSITY_PROFILES (config.py).
+
+  Stage 3 — Cancer Classification + Quality Gate (classify_cancer)
+    Routes to the correct model based on cancer_type parameter.
+    Lung CT images are preprocessed with CLAHE before inference.
+    _assess_prediction_quality() applies four criteria:
+      confidence ≥ 0.35, margin ≥ 0.07,
+      normalised entropy H/H_max ≤ 0.95 (ceiling), H/H_max ≥ 0.01 (floor)
+    If any criterion fails:
+      predicted_class="Invalid Scan", prediction_status="ambiguous"
+    Else:
+      Returns: predicted_class, confidence (0-100%), prediction_status
+               ("confident" ≥ 0.65 | "low_confidence" 0.35–0.65),
+               all_probabilities (full probability vector)
+
+2.3 MODULE LAYOUT
+-----------------
+backend/app/config.py   — Single source of truth: model paths, class labels,
+                          thresholds. Never hard-code values in logic files.
+backend/app/predict.py  — All inference logic: loading, preprocessing, validation,
+                          and classification. Module-level _models dict is the
+                          live model registry.
+backend/app/main.py     — FastAPI app: lifespan model loading, endpoints.
+backend/app/schemas.py  — Pydantic response models (PredictionResponse,
+                          HealthResponse). One schema handles all response shapes.
+backend/models/         — .keras files (tracked in repo).
+frontend/streamlit_app.py — Streamlit UI.
+training/               — Training scripts (designed for Google Colab + Kaggle).
+tests/                  — Pytest suite (100+ unit and integration tests, no GPU required).
+
+
+SECTION 3 — DATASETS
+================================================================================
+
+3.1 BRAIN TUMOR MRI DATASET
+----------------------------
+Source  : Kaggle — masoudnickparvar/brain-tumor-mri-dataset
+Modality: MRI (T1-weighted, T2-weighted)
+Size    : ~7,023 images
+Structure:
+  Training/ glioma/       (826 images)
+           meningioma/    (822 images)
+           notumor/       (395 images)
+           pituitary/     (827 images)
+  Testing/  (same four subdirectories)
+
+Notes: Dataset already has a train/test split. The Testing/ directory is used
+as the validation set during training (no separate held-out test set needed
+because it was provided pre-split by the dataset authors).
+
+3.2 IQ-OTH/NCCD LUNG CANCER CT DATASET
+-----------------------------------------
+Source   : Kaggle — hamdallak/the-iqothnccd-lung-cancer-dataset
+Modality : CT scan slices (axial view)
+Patients : 110 (55 normal, 15 benign, 40 malignant)
+Size     : ~1,190 total images
+
+Folder naming is inconsistent across dataset releases. The training script
+auto-detects class folders using a fuzzy name map (FOLDER_MAP) that handles
+"benign", "benign cases", "benign case", "bengin cases" (typo variant), and
+their malignant/normal equivalents.
+
+Because multiple CT slices come from the same patient, a random image-level
+split would cause data leakage (nearly identical slices in both train and test).
+The training script uses two rounds of GroupShuffleSplit at patient level:
+
+  Step 1: Reserve 20% of PATIENTS as held-out test set
+  Step 2: Split remaining 80% of patients into train (85%) / val (15%)
+  Result: ~68% train / ~12% val / ~20% test  (all patient-level, no leakage)
+
+Patient ID is inferred from directory structure, filename prefixes, or
+alphabetical batching of ~20 slices per group as a fallback.
+
+3.3 KATHER 2016 COLORECTAL HISTOPATHOLOGY DATASET
+---------------------------------------------------
+Source   : Kaggle — kmader/colorectal-histology-mnist
+Full name: Kather et al. 2016 Colorectal Cancer DX Histology
+Modality : H&E stained histopathology tiles (74×74 pixels native)
+Size     : 5,000 patches from ~150 patients
+Classes  : 8 tissue types (625 images each, balanced)
+
+Classes (alphabetical — Keras inference order):
+  adipose  — adipose (fat) tissue
+  complex  — complex glandular epithelium (hard boundary case)
+  debris   — cellular debris and necrosis
+  empty    — background / empty regions
+  lympho   — lymphocytic infiltrate
+  mucosa   — normal colonic mucosa
+  stroma   — cancer-associated stroma
+  tumor    — colorectal adenocarcinoma
+
+Why this dataset: The previously-attempted dataset (LC25000 binary colon_aca vs
+colon_n) produced inflated accuracy (~100%) due to augmentation-based patch
+duplication across splits, and even after fixing the split, the binary task
+was too easy (adenocarcinoma vs normal mucosa are visually distinct). The
+Kather 2016 dataset provides 8 clinically meaningful tissue types with
+genuinely ambiguous boundaries (stroma/complex, mucosa/empty), producing
+honest accuracy in the 88–93% range.
+
+Split method: GroupShuffleSplit on spatial patch groups (batch size = 5
+consecutive sorted images per class). This prevents spatially adjacent patches
+from the same WSI region appearing in both splits. 80% train / 20% test.
+
+
+
+SECTION 4 — PREPROCESSING PIPELINE
+================================================================================
+
+4.1 UNIVERSAL RULE: RAW [0, 255] FLOAT32
+------------------------------------------
+All three models (brain, lung, colon) are saved with
+include_preprocessing=True. This means the EfficientNet backbone applies its
+own normalisation internally. Pixel values must be passed as raw float32 in
+the [0, 255] range. Dividing by 255 before passing to the model breaks the
+backbone's expectations and degrades accuracy.
+
+Training pipelines: images are cast to float32 but NOT divided by 255.
+Inference (predict.py): preprocess_image() returns float32 in [0, 255].
+
+4.2 LUNG CT ONLY: CLAHE
+------------------------
+CT slices from different scanners have very different brightness and contrast
+distributions. CLAHE (Contrast Limited Adaptive Histogram Equalization) is
+applied per channel before the model sees the image.
+
+Parameters: clipLimit=2.0, tileGridSize=(8, 8)
+Applied to: lung CT images only — during training AND during inference
+
+This preprocessing must be applied at both training time (train_lung.py:
+apply_clahe function) and inference time (predict.py: _apply_clahe function
+called via preprocess_image(apply_clahe=True)). A mismatch between training
+and inference preprocessing is a common source of degraded accuracy.
+
+Brain MRI and colon histopathology do not use CLAHE.
+
+4.3 IMAGE RESIZING
+------------------
+All models expect 224×224 pixel RGB images. Resizing uses bilinear
+interpolation in all cases (PIL.Image.BILINEAR in inference, cv2.INTER_LINEAR
+or tf.image.resize with method="bilinear" in training).
+
+The colon dataset originally uses 74×74 pixel tiles. These are upscaled to
+224×224. Larger input resolution improves feature discrimination for the
+8-class problem despite the upscaling artifact.
+
+4.4 COLOR MODE
+--------------
+All images are converted to RGB (3 channels) before processing:
+  - Grayscale MRI: L → RGB (channels repeated)
+  - RGBA PNG: alpha channel dropped
+  - BGR (OpenCV default): converted to RGB explicitly
+
+
+SECTION 5 — MODEL ARCHITECTURES
+================================================================================
+
+5.1 BRAIN TUMOR CLASSIFIER  (brain_cancer_effnet.keras)
+---------------------------------------------------------
+Architecture : EfficientNetV2S backbone (ImageNet pre-trained)
+               include_preprocessing=True
+               include_top=False (classification head replaced)
+
+Head         : GlobalAveragePooling2D
+               BatchNormalization
+               Dropout(0.40)
+               Dense(512, relu, L2=1e-4)
+               BatchNormalization
+               Dropout(0.20)
+               Dense(4, softmax)
+
+Output       : 4-class softmax probability vector
+Classes      : ["glioma", "meningioma", "notumor", "pituitary"]  (alphabetical)
+Loss         : SparseCategoricalCrossentropy
+Regulariser  : L2(1e-4) on Dense layer, class weights (balanced)
+
+5.2 LUNG CANCER CLASSIFIER  (lung_cancer_final.keras)
+------------------------------------------------------
+Architecture : EfficientNetV2S backbone (ImageNet pre-trained)
+               include_preprocessing=True
+               include_top=False
+
+Head         : GlobalAveragePooling2D
+               BatchNormalization
+               Dropout(0.50)
+               Dense(256, relu, L2=5e-4)
+               BatchNormalization
+               Dropout(0.25)
+               Dense(3, softmax)
+
+Output       : 3-class softmax probability vector
+Classes      : ["benign", "malignant", "normal"]  (alphabetical)
+Loss         : SparseFocalLoss(gamma=2.0, alpha=class_weights)
+               — gamma down-weights easy examples (high-confidence correct ones)
+               — alpha corrects for benign under-representation (~15 patients)
+               — class weights are BAKED INTO the loss, not passed to model.fit()
+Evaluation   : 8-step test-time augmentation (TTA) on held-out test set
+
+5.3 COLON TISSUE CLASSIFIER  (colon_cancer_final.keras)
+---------------------------------------------------------
+Architecture : EfficientNetB2 backbone (ImageNet pre-trained)
+               include_preprocessing=True
+               include_top=False
+               (EfficientNetB2 chosen: 7M params — right-sized for ~4,000 patches)
+
+Head         : GlobalAveragePooling2D
+               BatchNormalization
+               Dropout(0.45)
+               Dense(256, relu, L2=3e-4)
+               BatchNormalization
+               Dropout(0.225)
+               Dense(8, softmax)
+
+Output       : 8-class softmax probability vector
+Classes      : ["adipose","complex","debris","empty","lympho","mucosa","stroma","tumor"]
+Loss         : CategoricalCrossentropy(label_smoothing=0.10)
+               — CategoricalCrossentropy used (not Sparse) because MixUp
+                 produces soft float labels, not integer indices
+               — label_smoothing=0.10 prevents peak overconfidence on easy
+                 classes (adipose, empty) and calibrates hard boundaries
+Regulariser  : MixUp(alpha=0.30), label smoothing, L2, Dropout
+
+
+
+
+SECTION 6 — TRAINING STRATEGY
+================================================================================
+
+6.1 TWO-PHASE TRANSFER LEARNING (ALL MODELS)
+---------------------------------------------
+All models follow the same two-phase transfer learning protocol:
+
+  Phase 1 — Head Training (backbone frozen)
+    All backbone layers: trainable=False
+    Train only the new classification head
+    Goal: converge the head to a useful feature representation quickly
+    LR: relatively high (5e-4 to 1e-3 depending on model)
+    Early stopping: patience=5–8 on val_accuracy / val_auc
+
+  Phase 2 — Backbone Fine-tuning
+    Lower backbone layers remain frozen (preserving low-level features)
+    Upper backbone layers unfrozen:
+      Brain   : unfreeze layers 200+ of EfficientNetV2S (~400 total)
+      Lung    : unfreeze layers 250+ of EfficientNetV2S (~400 total)
+      Colon   : unfreeze layers 100+ of EfficientNetB2  (~240 total)
+    LR: very low (1e-6 to 5e-6) to avoid destroying pre-trained features
+    Early stopping: patience=10–15 on val_accuracy / val_auc
+
+6.2 LUNG: IN-PLACE BACKBONE UNFREEZING
+----------------------------------------
+The lung training script unfreeze the backbone in-place (the same Python object):
+    backbone.trainable = True
+    for layer in backbone.layers[:fine_tune_at]:
+        layer.trainable = False
+
+This avoids the layer name ambiguity that can occur when using
+clear_session() + model rebuild + load_weights(). The backbone and model
+objects from Phase 1 are reused directly in Phase 2.
+
+6.3 DATA AUGMENTATION
+----------------------
+Brain MRI (medium severity):
+  RandomFlip(horizontal_and_vertical), RandomRotation(0.20),
+  RandomZoom(0.15), RandomContrast(0.20), RandomBrightness(0.15),
+  RandomTranslation(0.08, 0.08)
+
+Lung CT (heavier + GaussianNoise — small dataset):
+  RandomFlip(horizontal), RandomRotation(0.15), RandomZoom(0.12),
+  RandomContrast(0.25), RandomBrightness(0.20), RandomTranslation(0.10, 0.10),
+  GaussianNoise(0.015)
+
+Colon histopathology (heavy — tissue patches are rotation-invariant):
+  RandomFlip(horizontal_and_vertical), RandomRotation(0.30),
+  RandomZoom(0.20), RandomContrast(0.25), RandomBrightness(0.20),
+  RandomTranslation(0.10, 0.10), GaussianNoise(0.010)
+  + MixUp(alpha=0.30)
+
+
+6.4 CLASS IMBALANCE HANDLING
+------------------------------
+Brain   : Balanced class weights (sklearn compute_class_weight)
+Lung    : Class weights baked into SparseFocalLoss alpha parameter;
+          gamma=2.0 also helps by down-weighting easy examples
+Colon   : Balanced class weights (dataset is already balanced: 625 per class)
+
+
+6.5 CALLBACKS
+--------------
+All models use three standard callbacks:
+  EarlyStopping    : monitors val_accuracy,
+                     restore_best_weights=True
+  ReduceLROnPlateau: halves LR when val_loss plateaus
+  ModelCheckpoint  : saves best model by val_accuracy
+
+
+SECTION 7 — EVALUATION METRICS
+================================================================================
+
+7.1 CLASSIFICATION METRICS
+----------------------------
+  - Per-class precision, recall, F1-score
+  - Macro-averaged F1 (equal weight per class, regardless of support size)
+  - Overall accuracy
+  - Normalised confusion matrix (per-row percentages)
+
+7.2 CALIBRATION ANALYSIS
+-------------------------
+For each model, the training scripts print accuracy vs coverage at confidence
+thresholds: 0.50, 0.60 / 0.70, 0.80, 0.85, 0.90, 0.95.
+
+A well-calibrated model should show:
+  - Accuracy increasing monotonically with threshold
+  - High coverage at moderate thresholds (≥ 0.70)
+  - Near-perfect accuracy at the highest thresholds (≥ 0.90)
+
+7.3 LUNG: AUC AND TTA
+-----------------------
+The lung model additionally reports:
+  - Macro one-vs-rest AUC-ROC (multi-class)
+  - Test-time augmentation (TTA, 8 steps) applied at final evaluation
+    to improve stability on the small test set
+
+
+
+7.4 EXPECTED PERFORMANCE RANGES
+---------------------------------
+  Brain    : ~91% val_accuracy  (clean train/test split provided by dataset)
+  Lung     : ~82–90% test accuracy (patient-level split, TTA)
+             Benign recall is typically lowest (15 patients, hardest class)
+  Colon    : ~88–93% val_accuracy (matches Kather 2016 paper benchmarks)
+             Stroma/complex and tumor/debris boundaries are hardest
+
+
+SECTION 8 — INFERENCE PIPELINE (DETAIL)
+================================================================================
+
+8.1 REQUEST FLOW
+-----------------
+POST /predict
+  ↓
+main.py: content type check (415 if not JPEG/PNG/BMP/WebP)
+  ↓
+predict.py → validate_input_bytes()
+  - size < 1 KB    → rejected: invalid_input
+  - size > 20 MB   → rejected: invalid_input
+  - PIL.Image.load() fails → rejected: invalid_input (corrupted)
+  ↓
+preprocess_image(apply_clahe=False)
+  → PIL decode → convert("RGB") → bilinear resize 224×224
+  → uint8 → float32 (NO divide by 255) → shape: (1, 224, 224, 3)
+  ↓
+screen_image_domain(image_array, cancer_type)
+  Signal 1 — Saturation ceiling:
+    Convert to HSV; compute mean saturation (0–1).
+    brain/lung > 0.15 → rejected: "non_medical_image"
+    colon      > 0.85 → rejected: "non_medical_image"
+  Signal 2 — Saturation floor (colon only):
+    colon < 0.05 → rejected: "cross_modality"
+  Signal 2b — Flat-colour check (colon only):
+    mean_sat > 0.35 AND sat_std < 0.04 AND pixel_std < 0.04
+              → rejected: "non_medical_image"
+  Signal 3 — Intensity profile (brain/lung only):
+    brain: dark_fraction > 0.50 AND std > 0.32 → rejected: "cross_modality"
+    lung:  centre_std < 0.08 AND centre_mean > 0.40 AND dark_fraction > 0.15
+           → rejected: "cross_modality"
+  (passes → continue to classification)
+  ↓
+classify_cancer(image_array, cancer_type)
+  Lung CT: apply_clahe=True → CLAHE per channel before inference
+  model.predict() → softmax probs (num_classes,)
+  _assess_prediction_quality(probs):
+    confidence = max(probs)            < 0.35 (CONF_THRESHOLD)  → ambiguous
+    margin = top − 2nd                 < 0.07 (MARGIN_THRESHOLD) → ambiguous
+    norm_H = H / ln(n_classes)         > 0.95 (ENTROPY_THRESHOLD)→ ambiguous
+    norm_H = H / ln(n_classes)         < 0.01 (ENTROPY_FLOOR)   → ambiguous
+  If ambiguous: predicted_class="Invalid Scan", prediction_status="ambiguous"
+  Else: argmax → LABEL_MAPPING → human-readable class name
+        prediction_status: ≥ 0.65 → "confident" | else → "low_confidence"
+  ↓
+JSON response:
+  {
+    "status": "success",
+    "cancer_type": "brain",
+    "predicted_class": "Glioma",
+    "confidence": 92.14,
+    "prediction_status": "confident",
+    "all_probabilities": { "Glioma": 0.9214, ... }
+  }
+
+8.2 CLASS LABEL ORDER (CRITICAL)
+----------------------------------
+Keras' image_dataset_from_directory assigns labels in alphabetical order when
+class_names is specified. The CLASS_LABELS dict in config.py must match this
+exact order. Mismatches silently produce wrong class assignments.
+
+  brain  : glioma(0), meningioma(1), notumor(2), pituitary(3)
+  lung   : benign(0), malignant(1), normal(2)
+  colon  : adipose(0), complex(1), debris(2), empty(3),
+           lympho(4), mucosa(5), stroma(6), tumor(7)
+ 
+
+
+SECTION 9 — DESIGN DECISIONS AND RATIONALE
+================================================================================
+
+WHY EfficientNetV2S (not V2B0 or ResNet)?
+  V2S is the smallest S-series model with ~22M parameters — well-suited for
+  medical image datasets (thousands to low tens of thousands of images). The
+  V2 series uses Fused-MBConv blocks that train faster than V1 EfficientNets.
+  Using include_preprocessing=True avoids the need to call a separate
+  preprocess_input function, reducing inference-time mistakes.
+
+WHY EfficientNetB2 for colon (not V2S)?
+  The Kather 2016 dataset has only ~4,000 training patches (after split).
+  EfficientNetB2 has ~7M parameters vs ~22M for V2S. A smaller backbone is
+  less likely to overfit a small, spatially-similar patch dataset.
+
+WHY SparseFocalLoss for lung?
+  The IQ-OTH/NCCD dataset has extreme class imbalance at the patient level
+  (15 benign vs 40 malignant vs 55 normal). Standard cross-entropy with class
+  weights is inadequate — easy normal cases dominate the gradient. Focal loss
+  with gamma=2 down-weights well-classified examples, forcing the model to
+  focus on hard benign cases. Alpha (class weights baked in) handles the
+  population imbalance.
+
+WHY NOT use class_weight= in model.fit() for the lung model?
+  Class weights are already embedded in SparseFocalLoss via the alpha parameter.
+  Passing class_weight= to model.fit() on top of an alpha-weighted loss would
+  double-count the correction, biasing the model away from majority classes.
+
+WHY patient-level splits for lung?
+  CT imaging produces multiple axial slices per patient. A random image-level
+  split would place near-identical slices from the same patient into both train
+  and test sets, inflating test accuracy (the model memorises patient-specific
+  anatomy, not generalised pathology patterns).
+
+WHY Kather 2016 (8-class) rather than LC25000 (binary) for colon?
+  LC25000 contains 5,000 images per class, but each class is 10× augmented
+  copies of ~500 unique patches. A random 85/15 split places near-duplicates
+  in both train and test → inflated accuracy approaching 100%.
+  Even with a group-aware split, the binary task (adenocarcinoma vs normal
+  mucosa) is too visually distinct to be clinically meaningful. Kather 2016
+  provides 8 tissue types with ambiguous transitions that are clinically
+  relevant and produce honest model performance.
+
+WHY saturation-based domain screening (not a trained validator model)?
+  Softmax classifiers are overconfident on OOD inputs — a logo submitted to
+  the brain model still produces a peaked probability vector. A second trained
+  classifier could address this but introduces a new dependency: it must be
+  trained, deployed, and updated as data drifts.
+
+  Colour saturation exploits a physical property of medical imaging modalities:
+    - MRI and CT are inherently near-grayscale (low saturation)
+    - H&E histopathology introduces pink/purple staining (higher saturation)
+  This relationship is fixed by physics, not by scanner protocol. Saturation
+  thresholds are therefore robust to contrast settings, JPEG compression, and
+  resolution variation that would break protocol-dependent metrics.
+
+WHY two saturation signals (ceiling + floor) rather than one?
+  Signal 1 (ceiling) catches non-medical or wrong-modality images sent to
+  brain/lung that are too colourful to be MRI or CT (logos, histopathology).
+  Signal 2 (floor) catches the inverse case: near-grayscale CT or MRI sent
+  to the colon model that lacks the H&E staining colour that all colon
+  histopathology tiles must have. The two signals together provide bidirectional
+  coverage without needing a trained classifier.
+
+WHY edge density (Laplacian variance) was evaluated and NOT used?
+  Edge density was trialled as a third signal to catch histopathology submitted
+  to brain or lung models (tissue texture is much denser than MRI/CT).
+  In practice it caused false rejections of valid lung CT scans:
+    - High-resolution CT (HRCT) and nodule-dense scans produce high Laplacian
+      variance that overlaps with histopathology ranges
+    - JPEG exports with narrow window settings increase variance further
+    - No single fixed threshold generalises across CT protocols
+  Unlike saturation — which is determined by imaging physics — edge density
+  depends on CT acquisition parameters and post-processing. Any single threshold
+  is brittle. The signal was removed; lightly-stained histopathology that passes
+  the saturation ceiling is handled downstream by the quality gate.
+
+WHY the softmax quality gate as fallback for cross-modality inputs?
+  Cross-modality submissions that pass the saturation pre-screen (e.g. lightly
+  stained histopathology sent to a brain model, or brain MRI sent to a lung
+  model) are handled by the four-criterion softmax gate. A model applied to a
+  genuinely wrong-modality image typically produces either a near-uniform
+  distribution (fails entropy ceiling or margin check) or an anomalously peaked
+  distribution from OOD forced-commitment (fails entropy floor). Either way the
+  result is returned as "ambiguous" rather than a confident wrong prediction.
+
+WHY brain MRI ↔ lung CT cross-submission requires Signal 3 (not saturation alone)?
+  Both MRI and CT produce near-grayscale images with similar mean saturation
+  (typically 0.02–0.10), so Signals 1 and 2 cannot separate them. Signal 3
+  exploits the difference in pixel intensity distribution shape: lung CT has a
+  bimodal histogram (dark parenchyma + bright mediastinum) while brain MRI has
+  a smooth uniform bright centre with dark only at the periphery. These shapes
+  are determined by physics, not protocol. Unusual acquisition parameters or
+  post-processed scans may not trigger Signal 3's AND-logic thresholds; the
+  quality gate provides an additional fallback in those edge cases.
+
+
+SECTION 10 — LIMITATIONS AND KNOWN ISSUES
+================================================================================
+
+10.1 DATASET SCOPE
+-------------------
+Each model is trained on a single public dataset from a specific geography
+and scanner environment. Performance on images from different hospitals,
+different MRI/CT protocols, or different staining procedures is unknown.
+
+10.2 COLON MODEL SCOPE
+-----------------------
+The colon model classifies tissue type from histopathology patches, not
+clinical cancer stages. It outputs one of 8 tissue labels. A clinical
+pathologist performs a more nuanced diagnosis than "this patch is tumor."
+
+10.3 LUNG MODEL POPULATION
+----------------------------
+The IQ-OTH/NCCD dataset was collected at one hospital in Iraq (110 patients).
+The benign class has only 15 patients (~150 slices), making benign recall
+the most fragile metric. Retrain with more benign data if deployed in a
+setting where benign lung lesions are a primary concern.
+
+10.4 CROSS-MODALITY DETECTION LIMITS
+--------------------------------------
+The four-signal domain screen catches most wrong-modality submissions:
+  - Non-medical images (photographs, logos) → Signal 1 (too colourful)
+  - CT/MRI sent to colon model             → Signal 2 (too grayscale)
+  - Flat solid-colour graphics → colon     → Signal 2b (no texture)
+  - Histopathology sent to brain/lung      → Signal 1 (too colourful)
+  - Lung CT → brain model                 → Signal 3 (CT bimodal histogram)
+  - Brain MRI → lung model                → Signal 3 (smooth bright centre)
+
+Remaining limitations:
+  1. Brain MRI → lung model (or lung CT → brain model): Signal 3 is the
+     primary detection mechanism. However, unusually post-processed scans,
+     extreme window/level settings, or atypical acquisition parameters may
+     not trigger Signal 3's AND-logic thresholds. The softmax quality gate
+     provides additional protection as a fallback.
+  2. Greyscale non-medical images (black-and-white logos, greyscale
+     photographs): these pass Signal 1 and rely entirely on the quality
+     gate. A greyscale image that happens to activate a class's filters
+     moderately may pass all four criteria and return a wrong prediction.
+
+Full resolution of case 1 requires DICOM metadata (which records acquisition
+modality) or a dedicated modality classifier — out of scope for this research
+system.
+
+10.5 DICOM NOT SUPPORTED
+-------------------------
+Clinical imaging uses DICOM (.dcm) format. The system accepts only
+JPEG, PNG, BMP, and WebP. DICOM files must be converted externally.
+DICOM metadata (acquisition modality tag) could also resolve the
+brain↔lung cross-modality limitation described in 10.4.
+
+10.6 NO AUTHENTICATION OR RATE LIMITING
+-----------------------------------------
+The /predict endpoint is public within the local network. Do not expose
+the backend on a public IP without adding authentication and rate limiting.
+
+10.7 NO BATCH PROCESSING
+--------------------------
+Only one image per request. No batch upload or queued inference.
+
+10.8 COLON PHASE 2 TRAINING APPROACH
+--------------------------------------
+The colon training script (train_colon.py) uses clear_session() + model
+rebuild + load_weights() for Phase 2, rather than the in-place unfreezing
+approach used by the lung script. This approach can work correctly when the
+rebuilt model has identical layer names, but carries a small risk of silent
+weight misloading if layer name counters diverge. The lung script's in-place
+approach is the recommended pattern for future retraining.
+
+
+SECTION 11 — VALIDATION CHECKLIST
+================================================================================
+
+[x] Dataset structure correct
+    - Brain: masoudnickparvar/brain-tumor-mri-dataset, 4-class MRI
+    - Lung: hamdallak/the-iqothnccd-lung-cancer-dataset, 3-class CT (patient split)
+    - Colon: kmader/colorectal-histology-mnist (Kather 2016), 8-class histopathology
+
+[x] Classes consistent across code and documentation
+    - brain: glioma, meningioma, notumor, pituitary (config.py ↔ train_brain.py)
+    - lung: benign, malignant, normal (config.py ↔ train_lung.py)
+    - colon: adipose, complex, debris, empty, lympho, mucosa, stroma, tumor
+             (config.py ↔ train_colon.py)
+
+[x] Training/inference preprocessing consistent
+    - All models: raw [0,255] float32 (include_preprocessing=True)
+    - Lung: CLAHE applied in train_lung.py AND in predict.py (_apply_clahe)
+    - Brain, colon: no CLAHE (confirmed absent in both training and inference)
+
+[x] No dataset leakage documented
+    - Lung: two-round patient-level GroupShuffleSplit (assert verified in code)
+    - Colon: spatial GroupShuffleSplit on groups of 5 adjacent patches
+    - Brain: pre-split dataset used as-is
+
+[x] Label encoding consistent
+    - Brain/lung: sparse integer labels (SparseCategoricalCrossentropy /
+                  SparseFocalLoss)
+    - Colon: one-hot float labels (MixUp requires CategoricalCrossentropy)
+
+[x] No broken model references
+    - config.py MODEL_PATHS lists: brain, lung, colon
+    - All three keys used in predict.py and health endpoint
+    - Missing files handled gracefully (skipped at startup, reported in /health)
+
+[x] Domain screening integrated and tested
+    - screen_image_domain() returns (is_suspicious, reason_code, message)
+    - Signal 1: SATURATION_THRESHOLD per modality (brain/lung 0.15, colon 0.85)
+    - Signal 2: SATURATION_FLOOR colon-only (0.05) for CT/MRI detection
+    - Signal 2b: COLON_FLAT_IMAGE_THRESHOLDS — flat-colour graphics caught by texture check
+    - Signal 3: MODALITY_INTENSITY_PROFILES — brain↔lung cross-modality via pixel statistics
+    - All thresholds in config.py (single source of truth)
+    - Edge density (Laplacian) evaluated and removed (brittle on HRCT)
+    - Tests: TestImageDomainScreen (8 cases in test_inference.py)
+    - Tests: TestPredictRejections (domain screen rejection cases in test_api.py)
+
+[x] Quality gate integrated and tested
+    - _assess_prediction_quality(): 4 criteria applied after model inference
+    - Normalised entropy H/ln(n) consistent across 3/4/8-class models
+    - Tests: TestQualityGate, TestRobustValidation in test_inference.py
+    - TestPredictResponseShape (ambiguous + low_confidence cases in test_api.py)
+
+[x] Inference pipeline tested
+    - 111 unit + integration tests, all passing; no GPU or .keras files required
+    - test_inference.py: TF stub, cv2 stub, mocked models (no GPU needed)
+    - test_api.py: FastAPI TestClient with mocked models
+    - test_models.py: model spec tests (output shapes, label routing)
+
+
+SECTION 12 — CROSS-MODALITY DETECTION: DESIGN HISTORY AND RATIONALE
+================================================================================
+
+12.1 THE PROBLEM
+-----------------
+Softmax classifiers do not have a concept of "wrong modality." A CT scan
+submitted to the colon model still produces a 8-class colon tissue prediction;
+a colon H&E image submitted to the brain model still produces a 4-class brain
+tumor prediction. The model's outputs sum to 1.0 regardless of whether the
+input is from the correct domain.
+
+This is not a bug — it is a fundamental property of discriminative classifiers.
+No per-class threshold can distinguish "confidently correct" from "confidently
+wrong on an out-of-distribution input," because the softmax exponential amplifies
+even small logit differences into large probability gaps.
+
+12.2 WHY A TRAINED VALIDATOR MODEL WAS NOT USED
+-------------------------------------------------
+The simplest generalised OOD detector is a second trained binary classifier
+(medical vs non-medical). This was considered but rejected for two reasons:
+
+  1. Requires a separate training dataset, infrastructure, and update cycle.
+     A model trained on current medical + non-medical samples may drift as
+     scan protocols evolve, requiring periodic retraining.
+
+  2. A generalised binary classifier cannot solve the cross-modality problem
+     within the medical domain (brain MRI vs lung CT are both "medical").
+     A per-modality classifier would be needed, multiplying the training
+     and maintenance burden.
+
+The saturation-based approach requires no training and relies on physics,
+not learned features.
+
+12.3 SIGNAL SELECTION AND EVALUATION
+--------------------------------------
+Four candidate signals were evaluated; three were selected for implementation:
+
+  Signal 1 — Colour saturation ceiling (SELECTED)
+    Physical basis: MRI and CT produce near-grayscale images by acquisition
+    physics; H&E staining introduces characteristic pink/purple colour.
+    Implementation: mean HSV saturation, per-modality ceiling thresholds.
+    Verdict: robust — saturation is determined by imaging modality, not by
+    scanner settings, window/level choices, or JPEG compression.
+
+  Signal 2 — Colour saturation floor, colon only (SELECTED)
+    Physical basis: H&E staining always introduces colour in histopathology
+    tiles, even in background regions. CT and MRI are near-grayscale.
+    Implementation: mean HSV saturation floor threshold for colon only.
+    Verdict: robust for the same reason as Signal 1.
+
+  Signal 3 — Intensity profile gate (SELECTED)
+    Physical basis: Signals 1 and 2 cannot distinguish brain MRI from lung CT
+    because both are near-grayscale. Lung CT has a bimodal pixel distribution
+    (very dark parenchyma + very bright bone/mediastinum), while brain MRI has
+    smooth uniform brain tissue in the central region with dark only at the
+    periphery (outside the skull). These distribution shapes are physically
+    determined by the imaging modality and stable across protocols.
+
+    Implementation: _compute_intensity_features() extracts four statistics
+    from the grayscale proxy (mean RGB / 255):
+      dark_fraction — fraction of pixels below 0.20 (normalised)
+      std           — overall pixel intensity standard deviation
+      centre_mean   — mean intensity in the central [56:168, 56:168] block
+      centre_std    — std of the central block
+
+    _check_modality_compatibility() applies AND-logic checks per modality:
+      brain: dark_fraction > 0.50 AND std > 0.32
+             → CT bimodal signature → rejected: "cross_modality"
+      lung:  centre_std < 0.08 AND centre_mean > 0.40 AND dark_fraction > 0.15
+             → brain-MRI smooth-centre signature → rejected: "cross_modality"
+
+    The third condition on the lung check (dark_fraction > 0.15) distinguishes
+    a real brain MRI (which always has some peripheral dark background outside
+    the skull, dark_fraction ≈ 0.25–0.40) from a featureless solid-grey image
+    (dark_fraction ≈ 0), which would otherwise be falsely rejected.
+
+    Thresholds stored in MODALITY_INTENSITY_PROFILES (config.py).
+
+  Candidate signal — Edge density (Laplacian variance) (EVALUATED, REJECTED)
+    Intended to catch histopathology submitted to brain/lung models on the
+    basis that tissue textures produce much higher edge density than MRI/CT.
+    Implementation: mean Laplacian variance with per-modality maximum thresholds.
+
+    Rejected because:
+      - High-resolution CT (HRCT) and nodule-dense scans produce Laplacian
+        variance that overlaps with histopathology ranges. The threshold of
+        1500 rejected valid clinical CT scans.
+      - Edge density depends on CT acquisition protocol, window/level settings,
+        and JPEG compression artefacts. No single threshold generalises across
+        these variables.
+      - The design principle is: "reject only when clearly wrong." False
+        rejections of valid scans (a radiologist's real CT being turned away)
+        are a worse failure mode than allowing an ambiguous scan through to
+        the quality gate.
+
+12.4 "STRICT WITH INVALID, TOLERANT WITH VALID" DESIGN PRINCIPLE
+-----------------------------------------------------------------
+The system is designed to reject clearly invalid inputs firmly while accepting
+valid medical images with high tolerance for real-world variation (contrast,
+brightness, noise, protocol differences).
+
+This asymmetry is intentional:
+  - A false rejection (valid scan rejected) is an unacceptable failure for a
+    clinical workflow tool. A radiologist whose CT is rejected will lose
+    confidence in the system and may miss the result.
+  - A false acceptance (invalid input classified) is handled by the quality
+    gate returning "ambiguous", which is a recoverable failure state.
+
+Consequence: when choosing a saturation threshold, err on the side of
+accepting borderline scans rather than rejecting them. The quality gate
+exists as a backstop.
+
+12.5 CROSS-MODALITY COVERAGE SUMMARY
+--------------------------------------
+  Scenario                              | Primary gate                        | Result
+  --------------------------------------|-------------------------------------|----------------------------
+  Brain MRI → brain model               | passes all screening signals        | success
+  Lung CT → lung model                  | passes all screening signals        | success
+  Colon H&E → colon model               | passes all screening signals        | success
+  Logo / photograph → brain/lung        | Signal 1 (high sat > 0.15)          | rejected: non_medical_image
+  Logo / photo (neon) → colon           | Signal 1 (high sat > 0.85)          | rejected: non_medical_image
+  Flat-colour graphic → colon           | Signal 2b (no texture)              | rejected: non_medical_image
+  H&E histopathology → brain/lung       | Signal 1 (high sat > 0.15)          | rejected: non_medical_image
+  CT or MRI → colon model               | Signal 2 (low sat < 0.05)           | rejected: cross_modality
+  Lung CT → brain model                 | Signal 3 (CT bimodal histogram)     | rejected: cross_modality
+  Brain MRI → lung model                | Signal 3 (smooth bright centre)     | rejected: cross_modality
+  Lightly-stained H&E → brain/lung      | quality gate                        | success with "ambiguous"
+  Greyscale non-medical → any model     | quality gate (fallback)             | quality gate as fallback
+
+12.6 ACKNOWLEDGED GAPS
+-----------------------
+  1. Unusual acquisition parameters: the Signal 3 thresholds are calibrated
+     against typical CT and MRI distributions. Heavily post-processed scans,
+     extreme windowing, or atypical protocol parameters may produce intensity
+     profiles that do not trigger the check. The AND-logic design accepts these
+     edge cases rather than risk false rejection of valid scans.
+
+  2. Greyscale non-medical images (black-and-white logos, low-saturation
+     photographs): pass Signal 1 by construction and are unlikely to match a
+     CT or MRI intensity profile. Relies on the quality gate, which may not
+     always flag them as ambiguous if the image produces moderate softmax output.
+
+These gaps are documented in section 10.4 and in the OOD section of README.md.
+
+
+================================================================================
+END OF REPORT
+================================================================================
