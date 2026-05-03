@@ -142,8 +142,10 @@ raw_data/
 # EXPLICIT NEGATIONS — never excluded by any rule above
 # =============================================================================
 
-#models
-backend/models/*
+# Ignore all trained models inside models folder
+backend/models/*.keras
+
+# Keep folder structure
 !backend/models/.gitkeep
 
 # Demonstration dataset — required for demos and API smoke tests.
